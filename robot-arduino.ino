@@ -39,7 +39,15 @@
 * Note that pins D3, D9, D10 and D11 are PWM enabled.
 *****************************************************/
 
+/*******************************************************************************
+ * Includes
+ ******************************************************************************/
+
 #include <PID_v1.h>
+
+/*******************************************************************************
+ * Defines
+ ******************************************************************************/
 
 #define DISPLAY_INTERVAL ((microseconds_t) (1000UL * 1000UL))
 #define TICK_INTERVAL ((microseconds_t) (100UL * 1000UL))
@@ -51,11 +59,24 @@
 
 #define ELEMOF(x) (sizeof (x) / sizeof (x)[0])
 
-typedef unsigned long microseconds_t;
-static microseconds_t last_display;
-static microseconds_t last_tick;
+/*******************************************************************************
+ * Types
+ ******************************************************************************/
 
-/* The state indicates what we need next */
+/**
+Indicates we're counting in microseconds
+*/
+typedef unsigned long microseconds_t;
+
+/**
+Indicates we're counting in milliseconds
+*/
+typedef unsigned long milliseconds_t;
+
+/**
+Tracks input states. The value indicates what we need /next/ as opposed to
+what we already have.
+*/
 enum read_state_e
 {
     READ_STATE_M,
@@ -70,7 +91,10 @@ enum read_state_e
     READ_STATE_EOL
 };
 
-struct side_data_t
+/**
+Contains all the state for a single motor.
+*/
+struct motor_t
 {
     uint8_t remaining;
     double set_speed;
@@ -85,7 +109,20 @@ struct side_data_t
     PID pid;
 };
 
-static side_data_t motors[] =
+/**
+When we last updated the display.
+*/
+static microseconds_t last_display;
+
+/**
+When we last updated the motor counts.
+*/
+static microseconds_t last_tick;
+
+/**
+State for each motor.
+*/
+static motor_t motors[] =
 {
     {
         0, 0, 0, 0, 3, 2, 4, A0, A4, 0, PID(
@@ -117,12 +154,29 @@ static side_data_t motors[] =
     },
 };
 
+/**
+Current input state.
+*/
 static read_state_e read_state = READ_STATE_M;
+
+/**
+Variables for collecting input state before updating a motor_t instance.
+*/
 static uint8_t speed;
 static uint8_t count;
 static bool forwards;
 static bool left_side;
 
+/*******************************************************************************
+ * Functions
+ ******************************************************************************/
+
+/***************************************************************************//**
+ * The setup function is called once, at startup.
+ *
+ * We initialise pin directions, some PID parameters, and the quadrature
+ * interrupts.
+ ******************************************************************************/
 void setup()
 {
     Serial.begin(115200);
@@ -138,6 +192,15 @@ void setup()
     }
 }
 
+/***************************************************************************//**
+ * The loop function is called repeatedly by the Arduino C startup code.
+ *
+ * If enough time has passed, we will update the serial port with status.
+ *
+ * If enough time has passed, we will also reduce each motor tick count by one.
+ * If a motor gets to zero, it is stopped. This prevents the controller running
+ * on when the main PWRS application goes away for some reason.
+ ******************************************************************************/
 void loop()
 {
     microseconds_t this_time = micros();
@@ -158,6 +221,7 @@ void loop()
 
     for(int i = 0; i < ELEMOF(motors); i++)
     {
+#if USE_PID_MODE
         motors[i].pid.Compute();
         if (motors[i].output > 0)
         {
@@ -171,6 +235,20 @@ void loop()
             digitalWrite(motors[i].pinDIR_B, 1);
             analogWrite(motors[i].pinPWM, -motors[i].output);
         }
+#else
+        if (motors[i].set_speed > 0)
+        {
+            digitalWrite(motors[i].pinDIR_A, 1);
+            digitalWrite(motors[i].pinDIR_B, 0);
+            analogWrite(motors[i].pinPWM, motors[i].set_speed);
+        }
+        else
+        {
+            digitalWrite(motors[i].pinDIR_A, 0);
+            digitalWrite(motors[i].pinDIR_B, 1);
+            analogWrite(motors[i].pinPWM, -motors[i].set_speed);
+        }
+#endif
     }
 
     get_instruction();
@@ -354,7 +432,7 @@ static void process_command(
     uint8_t count
 )
 {
-    side_data_t* p_motor;
+    motor_t* p_motor;
     if (is_left)
     {
         p_motor = &motors[0];
@@ -380,7 +458,7 @@ static void update_motors()
 {
     for(int i = 0; i < ELEMOF(motors); i++)
     {
-        side_data_t* p_motor = &motors[i];
+        motor_t* p_motor = &motors[i];
         if (p_motor->remaining)
         {
             p_motor->remaining--;
@@ -396,7 +474,7 @@ static void print_status()
 {
     for(int i = 0; i < ELEMOF(motors); i++)
     {
-        side_data_t* p_motor = &motors[i];
+        motor_t* p_motor = &motors[i];
         Serial.print('M');
         Serial.print('I');
         Serial.print(i ? 'R' : 'L');
@@ -430,6 +508,6 @@ ISR(PCINT1_vect)
     // We should use PCMSK2 to limit this to A0..A3
 }
 
-//
-// End of file
-//
+/*******************************************************************************
+ * End of File
+ ******************************************************************************/
