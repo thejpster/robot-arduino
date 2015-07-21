@@ -49,9 +49,15 @@
  * Defines
  ******************************************************************************/
 
-#define DISPLAY_INTERVAL ((microseconds_t) (1000UL * 1000UL))
-#define TICK_INTERVAL ((microseconds_t) (100UL * 1000UL))
+#define DISPLAY_INTERVAL ((milliseconds_t) (1000UL))
+#define TICK_INTERVAL ((milliseconds_t) (100UL))
 #define MAX_EDGE_GAP ((microseconds_t) (100UL * 1000UL))
+
+#define MICROSECONDS_PER_SECOND ((microseconds_t) (1000UL * 1000UL))
+/// Get read speed back to 0..255
+#define SCALE_FACTOR (2.2)
+
+#define SMOOTHING_ALPHA 0.5
 
 #define K_P 2
 #define K_I 5
@@ -99,12 +105,14 @@ struct motor_t
     uint8_t remaining;
     double set_speed;
     double read_speed;
+    double read_speed_i;
     double output;
     const int pinPWM;
     const int pinDIR_A;
     const int pinDIR_B;
     const int pinIn_A;
     const int pinIn_B;
+    bool A_high;
     microseconds_t last_edge;
     PID pid;
 };
@@ -125,28 +133,28 @@ State for each motor.
 static motor_t motors[] =
 {
     {
-        0, 0, 0, 0, 3, 2, 4, A0, A4, 0, PID(
+        0, 0, 0, 0, 0, 3, 2, 4, A0, A4, false, 0, PID(
         &motors[0].read_speed,
         &motors[0].output,
         &motors[0].set_speed,
         K_P, K_I, K_D, DIRECT)
     },
     {
-        0, 0, 0, 0, 9, 5, 6, A1, A5, 0, PID(
+        0, 0, 0, 0, 0, 9, 5, 6, A1, A5, false, 0, PID(
         &motors[1].read_speed,
         &motors[1].output,
         &motors[1].set_speed,
         K_P, K_I, K_D, DIRECT)
     },
     {
-        0, 0, 0, 0, 10, 7, 8, A2, A6, 0, PID(
+        0, 0, 0, 0, 0, 10, 7, 8, A2, A6, false, 0, PID(
         &motors[2].read_speed,
         &motors[2].output,
         &motors[2].set_speed,
         K_P, K_I, K_D, DIRECT)
     },
     {
-        0, 0, 0, 0, 11, 12, 13, A3, A7, 0, PID(
+        0, 0, 0, 0, 0, 11, 12, 13, A3, A7, false, 0, PID(
         &motors[3].read_speed,
         &motors[3].output,
         &motors[3].set_speed,
@@ -190,6 +198,11 @@ void setup()
         pinMode(motors[i].pinIn_A, INPUT);
         pinMode(motors[i].pinIn_B, INPUT);
     }
+    // We cheat here. We know A0..A3 are PCINT8..PCINT11
+    // which are all on PCIE1.
+    PCMSK1 = (PCINT8 | PCINT9 | PCINT10 | PCINT11);
+    PCIFR  = bit(PCIF1);   // clear any outstanding interrupts
+    PCICR  |= bit(PCIE1);  // enable pin change interrupts
 }
 
 /***************************************************************************//**
@@ -203,8 +216,8 @@ void setup()
  ******************************************************************************/
 void loop()
 {
-    microseconds_t this_time = micros();
-    microseconds_t delta;
+    milliseconds_t this_time = millis();
+    milliseconds_t delta;
     delta = this_time - last_display;
     if (delta > DISPLAY_INTERVAL)
     {
@@ -221,32 +234,56 @@ void loop()
 
     for(int i = 0; i < ELEMOF(motors); i++)
     {
-#if USE_PID_MODE
-        motors[i].pid.Compute();
-        if (motors[i].output > 0)
+        microseconds_t now_us = micros();
+        // Copy data from ISR with interrupts off
+        motor_t* const p_motor = &motors[i];
+
+        uint8_t old_sreg;
+
+        old_sreg = SREG;
+        cli();
+        microseconds_t last_edge = p_motor->last_edge;
+        SREG = old_sreg;
+
+        if ((now_us - p_motor->last_edge) > MAX_EDGE_GAP)
         {
-            digitalWrite(motors[i].pinDIR_A, 1);
-            digitalWrite(motors[i].pinDIR_B, 0);
-            analogWrite(motors[i].pinPWM, motors[i].output);
+            p_motor->read_speed = 0;
         }
         else
         {
-            digitalWrite(motors[i].pinDIR_A, 0);
-            digitalWrite(motors[i].pinDIR_B, 1);
-            analogWrite(motors[i].pinPWM, -motors[i].output);
+            old_sreg = SREG;
+            cli();
+            p_motor->read_speed = p_motor->read_speed_i;
+            SREG = old_sreg;
+        }
+
+        // Update output speed
+#if USE_PID_MODE
+        p_motor->pid.Compute();
+        if (p_motor->output > 0)
+        {
+            digitalWrite(p_motor->pinDIR_A, 1);
+            digitalWrite(p_motor->pinDIR_B, 0);
+            analogWrite(p_motor->pinPWM, p_motor->output);
+        }
+        else
+        {
+            digitalWrite(p_motor->pinDIR_A, 0);
+            digitalWrite(p_motor->pinDIR_B, 1);
+            analogWrite(p_motor->pinPWM, -p_motor->output);
         }
 #else
-        if (motors[i].set_speed > 0)
+        if (p_motor->set_speed > 0)
         {
-            digitalWrite(motors[i].pinDIR_A, 1);
-            digitalWrite(motors[i].pinDIR_B, 0);
-            analogWrite(motors[i].pinPWM, motors[i].set_speed);
+            digitalWrite(p_motor->pinDIR_A, 1);
+            digitalWrite(p_motor->pinDIR_B, 0);
+            analogWrite(p_motor->pinPWM, p_motor->set_speed);
         }
         else
         {
-            digitalWrite(motors[i].pinDIR_A, 0);
-            digitalWrite(motors[i].pinDIR_B, 1);
-            analogWrite(motors[i].pinPWM, -motors[i].set_speed);
+            digitalWrite(p_motor->pinDIR_A, 0);
+            digitalWrite(p_motor->pinDIR_B, 1);
+            analogWrite(p_motor->pinPWM, -p_motor->set_speed);
         }
 #endif
     }
@@ -474,10 +511,10 @@ static void print_status()
 {
     for(int i = 0; i < ELEMOF(motors); i++)
     {
-        motor_t* p_motor = &motors[i];
+        motor_t* const p_motor = &motors[i];
         Serial.print('M');
         Serial.print('I');
-        Serial.print(i ? 'R' : 'L');
+        Serial.print(i, DEC);
         if (p_motor->output > 0)
         {
             Serial.print('+');
@@ -500,12 +537,26 @@ static void print_status()
 // Fires on A0 to A3 change
 ISR(PCINT1_vect)
 {
-    // Read A0, A1, A2 and A3 to see if any have changed
-    // If so, stash the timing delta
-    // Also check 2, 4, 5 and 6 to verify rotation direction
-    // Same level = +ve, different level = -ve (or possibly the other way around)
-
-    // We should use PCMSK2 to limit this to A0..A3
+    microseconds_t now = micros();
+    for(int i = 0; i < ELEMOF(motors); i++)
+    {
+        motor_t* const p_motor = &motors[i];
+        bool A_high = digitalRead(p_motor->pinIn_A);
+        if (A_high != p_motor->A_high)
+        {
+            /* It changed */
+            double delta = now - p_motor->last_edge;
+            p_motor->last_edge = now;
+            p_motor->A_high = A_high;
+            if (digitalRead(p_motor->pinIn_B) != A_high)
+            {
+                delta = -delta;
+            }
+            delta *= SCALE_FACTOR;
+            p_motor->read_speed_i *= (1 - SMOOTHING_ALPHA);
+            p_motor->read_speed_i += SMOOTHING_ALPHA * (MICROSECONDS_PER_SECOND / delta);
+        }
+    }
 }
 
 /*******************************************************************************
