@@ -1,9 +1,9 @@
-/*****************************************************
+/*******************************************************************************
 *
 * Pi Wars Robot Software (PWRS) Motor Controller
 *
 * Copyright (c) 2014 Matt Kingston (mattkingston@gmail.com)
-* Copyright (c) 2014-2015 Jonathan Pallant (pwrs@thejpster.org.uk)
+* Copyright (c) 2014-2016 Jonathan 'theJPster' Pallant (pwrs@thejpster.org.uk)
 *
 * PWRS is free software: you can redistribute it and/or modify
 * it under the terms of the GNU General Public License as published by
@@ -19,544 +19,686 @@
 * along with PWRS.  If not, see <http://www.gnu.org/licenses/>.
 *
 * This is the motor controller software, in the form of an
-* Arduino sketch. It operates four individual motors, each
-* with closed loop feedback control.
+* Arduino sketch.
 *
-* Four quadrature inputs are required, on pins
+* Messages look like this:
 *
-* A0 / A4
-* A1 / A5
-* A2 / A6
-* A3 / A7
+* COMMAND DATA_LEN <DATA> CRC
 *
-* The four motor outputs are (PWM, Dir A, Dir B)
+* Message are then SLIP encoded for transmission over the UART.
 *
-* D3, D2, D4
-* D9, D5, D6
-* D10, D7, D8
-* D11, D12, D13
+* Frame Start/End: MESSAGE_HEADER
+* MESSAGE_HEADER => MESSAGE_ESC MESSAGE_ESC_HEADER
+* MESSAGE_ESC    => MESSAGE_ESC MESSAGE_ESC_ESC
 *
-* Note that pins D3, D9, D10 and D11 are PWM enabled.
-*****************************************************/
+******************************************************************************/
 
 /*******************************************************************************
  * Includes
  ******************************************************************************/
-
-#include <PID_v1.h>
+// None
 
 /*******************************************************************************
- * Defines
+ * Defines / Constants
  ******************************************************************************/
 
-#define DISPLAY_INTERVAL ((milliseconds_t) (1000UL))
-#define TICK_INTERVAL ((milliseconds_t) (100UL))
-#define MAX_EDGE_GAP ((microseconds_t) (100UL * 1000UL))
 
-#define MICROSECONDS_PER_SECOND ((microseconds_t) (1000UL * 1000UL))
-/// Get read speed back to 0..255
-#define SCALE_FACTOR (2.2)
+#define MESSAGE_HEADER             0xC0
+#define MESSAGE_ESC                0xDB
+#define MESSAGE_ESC_HEADER         0xDC
+#define MESSAGE_ESC_ESC            0xDD
 
-#define SMOOTHING_ALPHA 0.5
+#define MAX_MESSAGE_LEN 254
 
-#define K_P 2
-#define K_I 5
-#define K_D 1
+#define SERIAL_RX  0
+#define SERIAL_TX  1
+
+#define QUAD1      2
+#define PWM1       3 // PWM
+#define QUAD2      4
+#define PWM2       5 // PWM
+#define PWM3       6 // PWM
+#define QUAD4      7
+#define QUAD3      8
+#define PWM4       9 // PWM
+
+#define DIR12     10 // PWM
+#define DIR34     11 // PWM
+
+// #define UNUSED 12
+
+#define SONAR_A   A0
+#define SONAR_B   A1
+#define SONAR_C   A2
+
+// #define UNUSED A3
+
+#define CUR1      A4
+#define CUR2      A5
+// A6/A7 are analog inputs only
+#define CUR3      A6
+#define CUR4      A7
+
+// Max distance (in cm)
+#define MAX_DISTANCE_CM 100
 
 #define ELEMOF(x) (sizeof (x) / sizeof (x)[0])
 
+#define MAX_SPEED 320
+
+#define NUM_SONARS 3
+// Max uS to wait for a sensor to start (guards against being
+// unplugged).
+#define MAX_SENSOR_WAIT 5800
+
+
 /*******************************************************************************
- * Types
+ * Data Types
  ******************************************************************************/
 
 /**
 Indicates we're counting in microseconds
 */
-typedef unsigned long microseconds_t;
+typedef uint32_t microseconds_t;
 
-/**
-Indicates we're counting in milliseconds
-*/
-typedef unsigned long milliseconds_t;
-
-/**
-Tracks input states. The value indicates what we need /next/ as opposed to
-what we already have.
-*/
-enum read_state_e
+// The different commands we support
+typedef enum motor_command_t
 {
-    READ_STATE_M,
-    READ_STATE_X,
-    READ_STATE_SIDE,
-    READ_STATE_DIR,
-    READ_STATE_SPEED_1,
-    READ_STATE_SPEED_2,
-    READ_STATE_COMMA,
-    READ_STATE_COUNT_1,
-    READ_STATE_COUNT_2,
-    READ_STATE_EOL
+	MESSAGE_COMMAND_SPEED_REQ,
+	MESSAGE_COMMAND_SPEED_IND,
+	MESSAGE_COMMAND_CURRENT_OVERFLOW_IND,
+	MESSAGE_COMMAND_CURRENT_IND,
+	MESSAGE_COMMAND_RANGE_IND,
+	MAX_VALID_COMMAND
+} motor_command_t;
+
+typedef struct message_speed_req_t
+{
+	uint32_t ctx;
+	uint8_t side; // 0 = left, 1 = right
+	uint8_t clicks; // max clicks to travel
+	int16_t speed; // clicks per second
+} message_speed_req_t;
+
+typedef struct message_speed_ind_t
+{
+	uint16_t speed;
+	uint8_t motor;
+} message_speed_ind_t;
+
+typedef struct message_range_ind_t
+{
+	uint16_t range;
+	uint8_t sensor;
+} message_range_ind_t;
+
+typedef struct message_current_ind_t
+{
+	uint16_t current;
+	uint8_t motor;
+} message_current_ind_t;
+
+typedef struct rx_message_t
+{
+	motor_command_t command;
+	size_t data_len;
+	size_t data_read;
+	uint8_t data[MAX_MESSAGE_LEN];
+} rx_message_t;
+
+typedef enum read_state_t
+{
+	READ_STATE_IDLE,
+	READ_STATE_COMMAND,
+	READ_STATE_LEN,
+	READ_STATE_DATA,
+	READ_STATE_CHECKSUM,
+} read_state_t;
+
+// A number of clicks (from the quadrature encoder logic on the controller
+// board) per second
+typedef uint16_t cps_t;
+
+// The robot can go forwards or in reverse
+typedef enum direction_t
+{
+	FORWARD,
+	REVERSE
+} direction_t;
+
+// Represents a motor we try and control, with a current speed,
+// a click count, and a pin to PWM.
+class Motor
+{
+public:
+	Motor(int index, int pwm_pin, int current_pin, int irq_pin);
+	void process(direction_t dir, microseconds_t delta, cps_t target_speed);
+	void report();
+	void tick();
+	void halt();
+	uint16_t get_current();
+private:
+	int m_index;
+	int m_pwm_pin;
+	int m_current_pin;
+	int m_irq_pin;
+	cps_t m_current_speed;
+	volatile uint8_t m_counter;
 };
 
-/**
-Contains all the state for a single motor.
-*/
-struct motor_t
+// Each side has two motors, which run independently but we always drive them at
+// the same target speed and direction, otherwise the belt would snap.
+class Side
 {
-    uint8_t remaining;
-    double set_speed;
-    double read_speed;
-    double read_speed_i;
-    double output;
-    const int pinPWM;
-    const int pinDIR_A;
-    const int pinDIR_B;
-    const int pinIn_A;
-    const int pinIn_B;
-    bool A_high;
-    microseconds_t last_edge;
-    PID pid;
+public:
+	Side(int index, int front_pwm, int front_current_pin, int front_irq,
+	     int rear_pwm, int rear_current, int rear_irq, int dir_pin);
+	void process(microseconds_t delta);
+	void tick_front() { m_front.tick(); };
+	void tick_rear() { m_rear.tick(); };
+	void set_speed(direction_t dir, cps_t speed);
+	bool current_overflow();
+	void halt();
+private:
+	Motor m_front;
+	Motor m_rear;
+	cps_t m_target_speed;
+	direction_t m_dir;
+	int m_dir_pin;
 };
 
-/**
-When we last updated the display.
-*/
-static microseconds_t last_display;
+/*******************************************************************************
+ * Global Data
+ ******************************************************************************/
 
-/**
-When we last updated the motor counts.
-*/
-static microseconds_t last_tick;
 
-/**
-State for each motor.
-*/
-static motor_t motors[] =
+// Update time in microseconds
+const microseconds_t MAX_GAP = 50UL * 1000UL;
+
+/* Empirically, the motors don't seem to exceed this */
+/* 1 Amp in units of 4.9 mA */
+const uint16_t MAX_CURRENT = 1000 / 4.9;
+
+// Time in microseconds at the start of the measurement
+static microseconds_t start = 0;
+
+// For doing periodic things in the main loop
+static uint16_t step_counter = 0;
+
+// The left side of the robot
+static Side left(0, PWM1, CUR1, QUAD1, PWM2, CUR2, QUAD2, DIR12);
+
+// The right side of the robot
+static Side right(2, PWM3, CUR3, QUAD3, PWM4, CUR4, QUAD4, DIR34);
+
+// Message being received
+static rx_message_t rx_message;
+static read_state_t read_state = READ_STATE_IDLE;
+
+static uint8_t current_sonar = 0;
+
+static const int sonar_pins[NUM_SONARS] =
 {
-    {
-        0, 0, 0, 0, 0, 3, 2, 4, A0, A4, false, 0, PID(
-        &motors[0].read_speed,
-        &motors[0].output,
-        &motors[0].set_speed,
-        K_P, K_I, K_D, DIRECT)
-    },
-    {
-        0, 0, 0, 0, 0, 9, 5, 6, A1, A5, false, 0, PID(
-        &motors[1].read_speed,
-        &motors[1].output,
-        &motors[1].set_speed,
-        K_P, K_I, K_D, DIRECT)
-    },
-    {
-        0, 0, 0, 0, 0, 10, 7, 8, A2, A6, false, 0, PID(
-        &motors[2].read_speed,
-        &motors[2].output,
-        &motors[2].set_speed,
-        K_P, K_I, K_D, DIRECT)
-    },
-    {
-        0, 0, 0, 0, 0, 11, 12, 13, A3, A7, false, 0, PID(
-        &motors[3].read_speed,
-        &motors[3].output,
-        &motors[3].set_speed,
-        K_P, K_I, K_D, DIRECT)
-    },
+	SONAR_A,	SONAR_B,
+	SONAR_C
 };
 
-/**
-Current input state.
-*/
-static read_state_e read_state = READ_STATE_M;
-
-/**
-Variables for collecting input state before updating a motor_t instance.
-*/
-static uint8_t speed;
-static uint8_t count;
-static bool forwards;
-static bool left_side;
+static microseconds_t ping_start;
+static bool ping_running = false;
 
 /*******************************************************************************
  * Functions
  ******************************************************************************/
 
-/***************************************************************************//**
- * The setup function is called once, at startup.
- *
- * We initialise pin directions, some PID parameters, and the quadrature
- * interrupts.
+static void pin_irq1();
+static void pin_irq2();
+static void pin_irq3();
+static void pin_irq4();
+static void get_instruction();
+
+static uint8_t calc_checksum(const rx_message_t* p_message);
+static void process_rx_message(const rx_message_t* p_message);
+static void process_rx_byte(uint8_t byte);
+static void send_message(motor_command_t command, size_t data_len, const uint8_t* p_data);
+
+/*******************************************************************************
+ * Primary Functions
  ******************************************************************************/
+
 void setup()
 {
-    Serial.begin(115200);
-    for(int i = 0; i < ELEMOF(motors); i++)
-    {
-        motors[i].pid.SetOutputLimits(-255, 255);
-        motors[i].pid.SetMode(AUTOMATIC);
-        pinMode(motors[i].pinPWM, INPUT);
-        pinMode(motors[i].pinDIR_A, INPUT);
-        pinMode(motors[i].pinDIR_B, INPUT);
-        pinMode(motors[i].pinIn_A, INPUT);
-        pinMode(motors[i].pinIn_B, INPUT);
-    }
-    // We cheat here. We know A0..A3 are PCINT8..PCINT11
-    // which are all on PCIE1.
-    PCMSK1 = (PCINT8 | PCINT9 | PCINT10 | PCINT11);
-    PCIFR  = bit(PCIF1);   // clear any outstanding interrupts
-    PCICR  |= bit(PCIE1);  // enable pin change interrupts
+	Serial.begin(115200);
+	// Not required at this time
+	// enableInterrupt(QUAD1, pin_irq1, CHANGE);
+	// enableInterrupt(QUAD2, pin_irq2, CHANGE);
+	// enableInterrupt(QUAD3, pin_irq3, CHANGE);
+	// enableInterrupt(QUAD4, pin_irq4, CHANGE);
+	start = micros();
 }
 
-/***************************************************************************//**
- * The loop function is called repeatedly by the Arduino C startup code.
- *
- * If enough time has passed, we will update the serial port with status.
- *
- * If enough time has passed, we will also reduce each motor tick count by one.
- * If a motor gets to zero, it is stopped. This prevents the controller running
- * on when the main PWRS application goes away for some reason.
- ******************************************************************************/
 void loop()
 {
-    milliseconds_t this_time = millis();
-    milliseconds_t delta;
-    delta = this_time - last_display;
-    if (delta > DISPLAY_INTERVAL)
-    {
-        print_status();
-        last_display = this_time;
-    }
+	microseconds_t now = micros();
+	microseconds_t delta = now - start;
+	if (delta > MAX_GAP)
+	{
+		// Process left
+		left.process(delta);
+		if (left.current_overflow())
+		{
+			left.halt();
+			right.halt();
+			send_message(MESSAGE_COMMAND_CURRENT_OVERFLOW_IND, 0, nullptr);
+			delay(5000);
+		}
+		// Process right (more time has elapsed)
+		delta = micros() - start;
+		right.process(delta);
+		if (right.current_overflow())
+		{
+			left.halt();
+			right.halt();
+			send_message(MESSAGE_COMMAND_CURRENT_OVERFLOW_IND, 0, nullptr);
+			delay(5000);
+		}
 
-    delta = this_time - last_tick;
-    if (delta > TICK_INTERVAL)
-    {
-        update_motors();
-        last_tick = this_time;
-    }
+		if (ping_running)
+		{
+			// Timed out...
+			send_range(current_sonar, 65535);
+		}
 
-    for(int i = 0; i < ELEMOF(motors); i++)
-    {
-        microseconds_t now_us = micros();
-        // Copy data from ISR with interrupts off
-        motor_t* const p_motor = &motors[i];
+		// Pick next sonar
+		if (++current_sonar >= NUM_SONARS)
+		{
+			current_sonar = 0;
+		}
 
-        uint8_t old_sreg;
+		// Trigger a ping by lifting high for 10us
+		pinMode(sonar_pins[current_sonar], OUTPUT);
+		digitalWrite(sonar_pins[current_sonar], 1);
+		delayMicroseconds(10);
+		digitalWrite(sonar_pins[current_sonar], 0);
+		ping_start = micros();
+		pinMode(sonar_pins[current_sonar], INPUT);
+		ping_running = true;
+		// Spin until pin goes high (start of ping)
+		while (!digitalRead(sonar_pins[current_sonar]))
+		{
+			// Spin
+			microseconds_t delta = micros() - ping_start;
+			if (delta > MAX_SENSOR_WAIT)
+			{
+				// Not found
+				send_range(current_sonar, 0);
+				ping_running = false;
+				break;
+			}
+		}
 
-        old_sreg = SREG;
-        cli();
-        microseconds_t last_edge = p_motor->last_edge;
-        SREG = old_sreg;
+		// Reset loop delay
+		start = now;
+	}
 
-        if ((now_us - p_motor->last_edge) > MAX_EDGE_GAP)
-        {
-            p_motor->read_speed = 0;
-        }
-        else
-        {
-            old_sreg = SREG;
-            cli();
-            p_motor->read_speed = p_motor->read_speed_i;
-            SREG = old_sreg;
-        }
+	if (ping_running)
+	{
+		if (!digitalRead(sonar_pins[current_sonar]))
+		{
+			microseconds_t delta = micros() - ping_start;
+			uint16_t range = (uint16_t) (delta > 65535 ? 65535 : delta);
+			send_range(current_sonar, range);
+			ping_running = false;
+		}
+	}
 
-        // Update output speed
-#if USE_PID_MODE
-        p_motor->pid.Compute();
-        if (p_motor->output > 0)
-        {
-            digitalWrite(p_motor->pinDIR_A, 1);
-            digitalWrite(p_motor->pinDIR_B, 0);
-            analogWrite(p_motor->pinPWM, p_motor->output);
-        }
-        else
-        {
-            digitalWrite(p_motor->pinDIR_A, 0);
-            digitalWrite(p_motor->pinDIR_B, 1);
-            analogWrite(p_motor->pinPWM, -p_motor->output);
-        }
-#else
-        if (p_motor->set_speed > 0)
-        {
-            digitalWrite(p_motor->pinDIR_A, 1);
-            digitalWrite(p_motor->pinDIR_B, 0);
-            analogWrite(p_motor->pinPWM, p_motor->set_speed);
-        }
-        else
-        {
-            digitalWrite(p_motor->pinDIR_A, 0);
-            digitalWrite(p_motor->pinDIR_B, 1);
-            analogWrite(p_motor->pinPWM, -p_motor->set_speed);
-        }
-#endif
-    }
-
-    get_instruction();
+	get_instruction();
 }
 
-void get_instruction()
+/*******************************************************************************
+ * Other Functions
+ ******************************************************************************/
+
+
+void send_range(uint8_t sensor, uint16_t range_us)
 {
-    while (Serial.available())
-    {
-        char c = Serial.read();
-
-#if DEBUG_MODE
-        Serial.print("Checking ");
-        Serial.print(c);
-        Serial.print(" in ");
-        Serial.println(read_state, DEC);
-#endif
-
-        switch (read_state)
-        {
-        case READ_STATE_M:
-            if (c == 'M')
-            {
-                speed = 0;
-                count = 0;
-                read_state = READ_STATE_X;
-            }
-
-            break;
-
-        case READ_STATE_X:
-            if (c == 'X')
-            {
-                read_state = READ_STATE_SIDE;
-            }
-
-            break;
-
-        case READ_STATE_SIDE:
-            if (c == 'L')
-            {
-                left_side = true;
-                read_state = READ_STATE_DIR;
-            }
-            else if (c == 'R')
-            {
-                left_side = false;
-                read_state = READ_STATE_DIR;
-            }
-            else
-            {
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_DIR:
-            if (c == '+')
-            {
-                forwards = true;
-                read_state = READ_STATE_SPEED_1;
-            }
-            else if (c == '-')
-            {
-                forwards = false;
-                read_state = READ_STATE_SPEED_1;
-            }
-            else
-            {
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_SPEED_1:
-            if (parse_hex(c, &speed))
-            {
-                read_state = READ_STATE_SPEED_2;
-                speed <<= 4;
-            }
-            else
-            {
-                speed = 0;
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_SPEED_2:
-            if (parse_hex(c, &speed))
-            {
-                read_state = READ_STATE_COMMA;
-            }
-            else
-            {
-                speed = 0;
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_COMMA:
-            if (c == ',')
-            {
-                read_state = READ_STATE_COUNT_1;
-            }
-            else
-            {
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_COUNT_1:
-            if (parse_hex(c, &count))
-            {
-                read_state = READ_STATE_COUNT_2;
-                count <<= 4;
-            }
-            else
-            {
-                count = 0;
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_COUNT_2:
-            if (parse_hex(c, &count))
-            {
-                read_state = READ_STATE_EOL;
-            }
-            else
-            {
-                count = 0;
-                read_state = READ_STATE_M;
-            }
-
-            break;
-
-        case READ_STATE_EOL:
-            if ((c == '\n') || (c == '\r'))
-            {
-                process_command(speed, forwards, left_side, count);
-                read_state = READ_STATE_M;
-            }
-
-            break;
-        }
-    }
+	message_range_ind_t ind =
+	{
+		.range = range_us,
+		.sensor = sensor,
+	};
+	send_message(MESSAGE_COMMAND_RANGE_IND, sizeof(ind), reinterpret_cast<const uint8_t*>(&ind));
 }
 
-static bool parse_hex(char c, uint8_t* p_value)
+Side::Side(int index, int front_pwm, int front_current_pin, int front_irq, int rear_pwm, int rear_current, int rear_irq, int dir_pin) :
+	m_front(index, front_pwm, front_current_pin, front_irq),
+	m_rear(index + 1, rear_pwm, rear_current, rear_irq),
+	m_dir_pin(dir_pin),
+	m_dir(FORWARD),
+	m_target_speed(0)
 {
-    bool result = true;
-
-    if ((c >= '0') && (c <= '9'))
-    {
-        *p_value |= (c - '0');
-    }
-    else if ((c >= 'A') && (c <= 'F'))
-    {
-        *p_value |= (c - 'A') + 10;
-    }
-    else if ((c >= 'a') && (c <= 'f'))
-    {
-        *p_value |= (c - 'a') + 10;
-    }
-    else
-    {
-        result = false;
-    }
-
-    return result;
+	pinMode(dir_pin, OUTPUT);
+	digitalWrite(dir_pin, HIGH);
 }
 
-static void process_command(
-    uint8_t speed,
-    bool is_forward,
-    bool is_left,
-    uint8_t count
-)
+void Side::process(microseconds_t delta)
 {
-    motor_t* p_motor;
-    if (is_left)
-    {
-        p_motor = &motors[0];
-    }
-    else
-    {
-        p_motor = &motors[1];
-    }
-
-    if (is_forward)
-    {
-        p_motor->set_speed = speed;
-    }
-    else
-    {
-        p_motor->set_speed = -((double) speed);
-    }
-    p_motor->remaining = count;
-    print_status();
+	m_front.process(m_dir, delta, m_target_speed);
+	m_rear.process(m_dir, delta, m_target_speed);
+	if ((m_dir == FORWARD) && (m_target_speed != 0))
+	{
+		digitalWrite(m_dir_pin, HIGH);
+	}
+	else
+	{
+		digitalWrite(m_dir_pin, LOW);
+	}
+	m_front.report();
+	m_rear.report();
 }
 
-static void update_motors()
+bool Side::current_overflow()
 {
-    for(int i = 0; i < ELEMOF(motors); i++)
-    {
-        motor_t* p_motor = &motors[i];
-        if (p_motor->remaining)
-        {
-            p_motor->remaining--;
-            if (p_motor->remaining == 0)
-            {
-                p_motor->set_speed = 0;
-            }
-        }
-    }
+	if (m_front.get_current() > MAX_CURRENT)
+	{
+		return true;
+	}
+	if (m_rear.get_current() > MAX_CURRENT)
+	{
+		return true;
+	}
+	return false;
 }
 
-static void print_status()
+void Side::halt()
 {
-    for(int i = 0; i < ELEMOF(motors); i++)
-    {
-        motor_t* const p_motor = &motors[i];
-        Serial.print('M');
-        Serial.print('I');
-        Serial.print(i, DEC);
-        if (p_motor->output > 0)
-        {
-            Serial.print('+');
-        }
-        else
-        {
-            Serial.print('-');
-        }
-        Serial.print(p_motor->output, DEC);
-        Serial.print(',');
-        Serial.print(p_motor->read_speed, DEC);
-        Serial.print(',');
-        Serial.print(p_motor->set_speed, DEC);
-        Serial.print(',');
-        Serial.println(p_motor->remaining, DEC);
-    }
+	m_target_speed = 0;
+	m_front.halt();
+	m_rear.halt();
+}
+
+void Side::set_speed(direction_t dir, cps_t cps)
+{
+	m_dir = dir;
+	m_target_speed = cps > MAX_SPEED ? MAX_SPEED : cps;
+}
+
+Motor::Motor(int index, int pwm_pin, int current_pin, int irq_pin) :
+	m_index(index),
+	m_pwm_pin(pwm_pin),
+	m_current_pin(current_pin),
+	m_irq_pin(irq_pin)
+{
+	// Turn motor off
+	analogWrite(m_pwm_pin, 0);
+	// pullup on
+	pinMode(irq_pin, INPUT);
+	digitalWrite(irq_pin, HIGH);
+	// pullup off
+	pinMode(current_pin, INPUT);
+	digitalWrite(current_pin, LOW);
+}
+
+void Motor::report()
+{
+	// message_speed_ind_t ind =
+	// {
+	// 	.speed = m_current_speed,
+	// 	.motor = (uint8_t) m_index,
+	// };
+	// send_message(MESSAGE_COMMAND_SPEED_IND, sizeof(ind), reinterpret_cast<const uint8_t*>(&ind));
+}
+
+void Motor::process(direction_t dir, microseconds_t delta, cps_t target)
+{
+	const uint8_t counter_copy = m_counter;
+	m_counter = 0;
+	m_current_speed = (1000UL * 1000UL * counter_copy) / delta;
+	uint32_t speed = (((uint32_t) target) * 255) / MAX_SPEED;
+	analogWrite(m_pwm_pin, speed > 255 ? 255 : speed);
+}
+
+void Motor::tick()
+{
+	m_counter++;
+}
+
+void Motor::halt()
+{
+	analogWrite(m_pwm_pin, 0);
+	m_current_speed = 0;
+	m_counter = 0;
+}
+
+/**
+ * Returns the amount of current used by this motor. Takes 100us to execute.
+ * Reads in units of 4.9mA.
+ */
+uint16_t Motor::get_current()
+{
+	uint16_t current = analogRead(m_current_pin);
+	message_current_ind_t ind = {current, (uint8_t) m_index};
+	send_message(MESSAGE_COMMAND_CURRENT_IND, sizeof(ind), reinterpret_cast<const uint8_t*>(&ind));
+}
+
+/**
+ * The encoder runs at 333.3 clicks per revolution and the motor can't
+ * run at more than 3 revolutions per second, so we've got at least 1 millisecond
+ * in between clicks. This is for motor 1.
+ */
+static void pin_irq1()
+{
+	left.tick_front();
+}
+
+/**
+ * This is for motor 2. See `pin_irq1`.
+ */
+static void pin_irq2()
+{
+	left.tick_rear();
+}
+
+/**
+ * This is for motor 3. See `pin_irq1`.
+ */
+static void pin_irq3()
+{
+	right.tick_front();
+}
+
+/**
+ * This is for motor 4. See `pin_irq1`.
+ */
+static void pin_irq4()
+{
+	right.tick_rear();
+}
+
+/**
+ * Read from the serial port and update the motor state depending on the command
+ * received.
+ */
+static void get_instruction()
+{
+	static bool is_escape = false;
+	while (Serial.available())
+	{
+		uint8_t data = Serial.read();
+		if (is_escape)
+		{
+			if (data == MESSAGE_ESC_HEADER)
+			{
+				// Escaped header => process normally
+				process_rx_byte(MESSAGE_HEADER);
+			}
+			else if (data == MESSAGE_ESC_ESC)
+			{
+				process_rx_byte(MESSAGE_ESC);
+			}
+			else
+			{
+				// printf("Bad escape 0x%02x\r\n", data);
+			}
+			is_escape = false;
+		}
+		else if (data == MESSAGE_ESC)
+		{
+			is_escape = true;
+		}
+		else if (data == MESSAGE_HEADER)
+		{
+			// Unescaped header => start of message
+			read_state = READ_STATE_COMMAND;
+		}
+		else
+		{
+			process_rx_byte(data);
+		}
+	}
+}
+
+/**
+ * Calculate the message checksum.
+ *
+ * XORs the all the bytes in the given message.
+ *
+ * @return the calculated checksum
+ */
+static uint8_t calc_checksum(const rx_message_t* p_message)
+{
+	uint8_t result = 0xFF;
+	result ^= (uint8_t) p_message->command;
+	result ^= (uint8_t) p_message->data_len;
+	for (size_t i = 0; i < p_message->data_len; i++)
+	{
+		result ^= p_message->data[i];
+	}
+	return result;
+}
+
+/**
+ * Process the message from the controller. Currently just
+ * does some logging. Checksums have already been verified at
+ * this stage.
+ *
+ * @param[in] p_message The received message
+ */
+static void process_rx_message(const rx_message_t* p_message)
+{
+	switch (p_message->command)
+	{
+	case MESSAGE_COMMAND_SPEED_REQ:
+		if (p_message->data_len == sizeof(message_speed_req_t))
+		{
+			const message_speed_req_t* p_req = reinterpret_cast<const message_speed_req_t*>(p_message->data);
+			direction_t dir = (p_req->speed < 0) ? FORWARD : REVERSE;
+			cps_t speed = abs(p_req->speed);
+			if (p_req->side == 0)
+			{
+				left.set_speed(dir, speed);
+			}
+			else if (p_req->side == 1)
+			{
+				right.set_speed(dir, speed);
+			}
+		}
+		break;
+	}
 }
 
 
-// Fires on A0 to A3 change
-ISR(PCINT1_vect)
+/**
+ * Feed incoming bytes through the state machine.
+ * Will call process_rx_message() when a valid message
+ * has been received.
+ *
+ * @param[in] byte The received byte
+ */
+static void process_rx_byte(uint8_t byte)
 {
-    microseconds_t now = micros();
-    for(int i = 0; i < ELEMOF(motors); i++)
-    {
-        motor_t* const p_motor = &motors[i];
-        bool A_high = digitalRead(p_motor->pinIn_A);
-        if (A_high != p_motor->A_high)
-        {
-            /* It changed */
-            double delta = now - p_motor->last_edge;
-            p_motor->last_edge = now;
-            p_motor->A_high = A_high;
-            if (digitalRead(p_motor->pinIn_B) != A_high)
-            {
-                delta = -delta;
-            }
-            delta *= SCALE_FACTOR;
-            p_motor->read_speed_i *= (1 - SMOOTHING_ALPHA);
-            p_motor->read_speed_i += SMOOTHING_ALPHA * (MICROSECONDS_PER_SECOND / delta);
-        }
-    }
+	switch (read_state)
+	{
+	case READ_STATE_IDLE:
+		break;
+	case READ_STATE_COMMAND:
+		if (byte <= MAX_VALID_COMMAND)
+		{
+			rx_message.command = (motor_command_t) byte;
+			read_state = READ_STATE_LEN;
+		}
+		else
+		{
+			read_state = READ_STATE_IDLE;
+		}
+		break;
+	case READ_STATE_LEN:
+		rx_message.data_read = 0;
+		rx_message.data_len = byte;
+		read_state = rx_message.data_len ? READ_STATE_DATA : READ_STATE_CHECKSUM;
+		break;
+	case READ_STATE_DATA:
+		rx_message.data[rx_message.data_read++] = byte;
+		if (rx_message.data_read == rx_message.data_len)
+		{
+			read_state = READ_STATE_CHECKSUM;
+		}
+		break;
+	case READ_STATE_CHECKSUM:
+		if (byte == calc_checksum(&rx_message))
+		{
+			process_rx_message(&rx_message);
+		}
+		else
+		{
+			// printf("Dropping bad packet\r\n");
+		}
+		read_state = READ_STATE_IDLE;
+		break;
+	}
+}
+
+static void write_esc(uint8_t data)
+{
+	if (data == MESSAGE_ESC)
+	{
+		Serial.write(MESSAGE_ESC);
+		Serial.write(MESSAGE_ESC_ESC);
+	}
+	else if (data == MESSAGE_HEADER)
+	{
+		Serial.write(MESSAGE_ESC);
+		Serial.write(MESSAGE_ESC_HEADER);
+	}
+	else
+	{
+		Serial.write(data);
+	}
+}
+
+static void send_message(motor_command_t command, size_t data_len, const uint8_t* p_data)
+{
+	uint8_t csum = 0xFF;
+
+	if (data_len >= 256)
+	{
+		return;
+	}
+
+	Serial.write(MESSAGE_HEADER);
+
+	write_esc((uint8_t) command);
+	csum ^= (uint8_t) command;
+
+	write_esc((uint8_t) data_len);
+	csum ^= (uint8_t) data_len;
+
+	for (size_t i = 0; i < data_len; i++)
+	{
+		write_esc(p_data[i]);
+		csum ^= (uint8_t) p_data[i];
+	}
+
+	write_esc(csum);
 }
 
 /*******************************************************************************
